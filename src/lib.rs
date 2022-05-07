@@ -1,8 +1,8 @@
 use basebits::{hamming_dist_none, BaseBits};
 //use rayon::iter::ParBridge;
 use rayon::prelude::*;
-use rust_htslib::bam::errors::Error;
-use rust_htslib::bam::record::{Aux, Cigar, CigarString};
+use rust_htslib::errors::Error;
+use rust_htslib::bam::record::{Aux, AuxArray, Cigar, CigarString};
 use rust_htslib::bam::{self, Read};
 use std::cmp::Ordering;
 use std::collections::hash_map::{Entry::Occupied, Entry::Vacant};
@@ -38,11 +38,11 @@ pub struct Node {
 
 #[derive(Hash, PartialEq, Eq, Debug, Clone)]
 pub struct Position {
-    pos: i32,
+    pos: i64,
     is_spliced: Option<u32>,
     is_rev: bool,
     target: i32,
-    tlen: Option<i32>,
+    tlen: Option<i64>,
 }
 
 impl PartialOrd for Position {
@@ -82,7 +82,7 @@ impl Position {
     pub fn new(record: &bam::record::Record, ignore_splice_pos: bool, use_tlen: bool) -> Self {
         let mut pos = record.pos();
         let mut is_spliced: Option<u32>;
-        let tlen: Option<i32>;
+        let tlen: Option<i64>;
         let cigarview = record.cigar();
         let cigar = &cigarview;
 
@@ -90,13 +90,13 @@ impl Position {
             pos = cigarview.end_pos();
             // if the end of the read was soft clipped, add that amount back to its pos
             if let Cigar::SoftClip(num) = cigar[cigar.len() - 1] {
-                pos = pos + num as i32;
+                pos = pos + num as i64;
             }
 
             is_spliced = Position::find_splice(&cigar, true);
         } else {
             if let Cigar::SoftClip(num) = cigar[0] {
-                pos = pos - num as i32;
+                pos = pos - num as i64;
             }
             is_spliced = Position::find_splice(&cigar, false);
         }
@@ -224,7 +224,7 @@ pub type ReadMap = BTreeMap<Position, UmiMap>;
 pub fn run_dedup(config: &Config) -> Result<(), &'static str> {
     let mut bam = bam::Reader::from_path(&config.input_bam).unwrap();
     let header = bam::Header::from_template(bam.header());
-    let mut writer = bam::Writer::from_path(&config.output_bam, &header, bam::Format::BAM).unwrap();
+    let mut writer = bam::Writer::from_path(&config.output_bam, &header, bam::Format::Bam).unwrap();
     let mut read_store: HashSet<Vec<u8>> = HashSet::new();
     let (sender, reciever) = channel();
     let global_stats = Arc::new(Mutex::new(Stats::new()));
@@ -281,8 +281,8 @@ pub fn run_dedup(config: &Config) -> Result<(), &'static str> {
 pub fn run_group(config: &Config) -> Result<(), &'static str> {
     let mut bam = bam::Reader::from_path(&config.input_bam).unwrap();
     let header = bam::Header::from_template(bam.header());
-    let mut writer = bam::Writer::from_path(&config.output_bam, &header, bam::Format::BAM).unwrap();
-    let mut read_store: HashMap<Vec<u8>, (bam::record::Aux, Vec<u8>)> = HashMap::new();
+    let mut writer = bam::Writer::from_path(&config.output_bam, &header, bam::Format::Bam).unwrap();
+    let mut read_store: HashMap<Vec<u8>, (u32, Vec<u8>)> = HashMap::new();
     let global_stats = Arc::new(Mutex::new(Stats::new()));
     let (sender, reciever) = channel();
 
@@ -304,22 +304,24 @@ pub fn run_group(config: &Config) -> Result<(), &'static str> {
         .flat_map(|(_, reads)| label_groups(reads, config))
         .for_each_with(sender, |s, x| s.send(x).unwrap());
 
-    let mut group_count: i64 = 0;
+    let mut group_count: u32 = 0;
     let mut reads_out = 0;
     reciever.iter().for_each(|mut group| {
         for read in group.iter_mut() {
             reads_out += 1;
-            read.push_aux(b"UG", &bam::record::Aux::Integer(group_count));
+            read.push_aux(b"UG", Aux::U32(group_count)).unwrap();
             writer.write(&read).unwrap_or_else(|err| {
                 eprintln!("Problem writing: {}", err);
                 process::exit(1);
             });
             if config.is_paired {
-                let umi = read.aux(b"BX").unwrap().string().to_vec();
-                read_store.insert(
-                    read.qname().to_vec(),
-                    (bam::record::Aux::Integer(group_count), umi),
-                );
+                if let Ok(bam::record::Aux::ArrayU8(bx)) = read.aux(b"BX") {
+                    let umi = bx.iter().collect::<Vec<_>>();
+                    read_store.insert(
+                        read.qname().to_vec(),
+                        (group_count, umi),
+                    );
+                };
             }
             group_count += 1;
         }
@@ -332,8 +334,9 @@ pub fn run_group(config: &Config) -> Result<(), &'static str> {
             .for_each(|mut read| {
                 if let Some((ug, bx_val)) = read_store.get(read.qname()) {
                     reads_out += 1;
-                    read.push_aux(b"UG", ug);
-                    read.push_aux(b"BX", &bam::record::Aux::String(&bx_val));
+                    read.push_aux(b"UG", bam::record::Aux::U32(*ug)).unwrap();
+                    let bx_aux_array: AuxArray<u8> = (&bx_val).into();
+                    read.push_aux(b"BX", bam::record::Aux::ArrayU8(bx_aux_array)).unwrap();
                     writer.write(&read).unwrap_or_else(|err| {
                         eprintln!("Problem writing: {}", err);
                         process::exit(1);
@@ -395,9 +398,10 @@ fn get_tag<'a>(record: &'a bam::record::Record, config: &Config) -> &'a [u8] {
             None => panic!("No tag in read id"),
         }
     } else {
-        match record.aux(config.umi_tag.as_bytes()) {
-            Some(tag) => tag.string(),
-            None => panic!("No tag on read"),
+        if let Ok(Aux::String(umi)) = record.aux(config.umi_tag.as_bytes()) {
+            umi.as_bytes()
+        } else {
+            panic!("No tag on read");
         }
     }
 }
@@ -534,13 +538,13 @@ pub fn connect_graph(mut graph: Vec<Node>, dist: u32, counts_factor: u32) -> Vec
 }
 
 // TODO: Use proper bk tree for faster lookups
-fn determine_umi<'a>(graph: &'a Vec<Node>, allowed_network_depth: usize) -> Vec<Group> {
+fn determine_umi<'a> (graph: &'a Vec<Node>, allowed_network_depth: usize) -> Vec<Group> {
     // Group the umis by distance
     let mut groups = vec![];
     let mut seen: Vec<usize> = Vec::new();
     // Create a vec of nodes indicies going from highest counts to lowest
     let mut graph_indicies: Vec<usize> = (0..graph.len()).collect();
-    &graph_indicies.sort_by(|&a, &b| graph[b].freq.freq.cmp(&graph[a].freq.freq));
+    graph_indicies.sort_by(|&a, &b| graph[b].freq.freq.cmp(&graph[a].freq.freq));
 
     for &x in graph_indicies.iter() {
         if seen.contains(&x) {
@@ -642,7 +646,7 @@ fn label_groups(reads: UmiMap, config: &Config) -> Vec<Vec<bam::record::Record>>
             if let ReadCollection::ManyReads(reads) = &node.freq.read {
                 for read in reads.into_iter() {
                     let mut read = read.clone();
-                    read.push_aux(b"BX", &bam::record::Aux::String(&master_umi.decode()));
+                    read.push_aux(b"BX", Aux::String(&master_umi.to_string())).unwrap();
                     group_list.push(read);
                 }
             } else {
@@ -655,7 +659,7 @@ fn label_groups(reads: UmiMap, config: &Config) -> Vec<Vec<bam::record::Record>>
 }
 
 /////////////////////// Helpers
-/// Decide wich read is better.
+/// Decide which read is better.
 /// For now this uses the simplistic approach of comparing mapq values.
 /// Returns true if alpha is better than beta, false otherwise
 fn read_a_ge_b(alpha: &bam::record::Record, beta: &bam::record::Record) -> bool {
@@ -663,21 +667,17 @@ fn read_a_ge_b(alpha: &bam::record::Record, beta: &bam::record::Record) -> bool 
     match alpha.mapq().cmp(&beta.mapq()) {
         Ordering::Less => false,
         Ordering::Greater => true,
-        // Take the read with the lowest number of muli mappings
-        Ordering::Equal => match alpha
-            .aux(b"NH")
-            .unwrap_or(Aux::Integer(0))
-            .integer()
-            .cmp(&beta.aux(b"NH").unwrap_or(Aux::Integer(0)).integer())
+        // Take the read with the lowest number of multi mappings
+        Ordering::Equal => match (if let Ok(Aux::I32(nh)) = alpha
+            .aux(b"NH") {nh} else {0}).
+            cmp(& if let Ok(Aux::I32(nh2)) = beta.aux(b"NH") {nh2} else {0})
         {
             Ordering::Less => true,
             Ordering::Greater => false,
             // Take the read with the smallest edit distance
-            Ordering::Equal => match alpha
-                .aux(b"NM")
-                .unwrap_or(Aux::Integer(0))
-                .integer()
-                .cmp(&beta.aux(b"NM").unwrap_or(Aux::Integer(0)).integer())
+            Ordering::Equal => match (if let Ok(Aux::I32(nh)) = alpha
+                .aux(b"NM") {nh} else {0})
+                .cmp(&if let Ok(Aux::I32(nh2)) = beta.aux(b"NM") {nh2} else {0})
             {
                 Ordering::Less => true,
                 Ordering::Greater => false,

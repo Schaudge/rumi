@@ -1,14 +1,9 @@
 #[macro_use]
 extern crate clap;
-//extern crate rumi_dedup_lib;
 use clap::{App, Arg};
-use rumi_lib;
-//use basebits::{hamming_dist, BaseBits};
-//use rust_htslib::bam;
-//use rust_htslib::prelude::*;
-//use std::collections::hash_map::{Entry::Occupied, Entry::Vacant};
-//use std::collections::HashMap;
 use std::process;
+use rumi_lib;
+
 
 fn main() {
     let matches = App::new("rumi")
@@ -87,7 +82,7 @@ fn main() {
                 ),
         )
         .arg(Arg::with_name("group_only").long("group_only").help(
-            "Don't deduplicate reads, just group them given them agroup id, and print them. Rules
+            "Don't deduplicate reads, just group them given them a group id, and print them. Rules
                 for filtering out unpaired reads, etc, will still be applied.",
         ))
         .arg(
